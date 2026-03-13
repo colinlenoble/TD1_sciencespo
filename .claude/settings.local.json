@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(conda run -n geo_commune python -c \":*)",
+      "Bash(\"C:\\\\Users\\\\colin\\\\anaconda3\\\\envs\\\\geo_commune\\\\python.exe\" -c \"import xarray as xr; ds=xr.open_dataset\\(''data/ds_filo_lcz_aligned.nc''\\); print\\(list\\(ds.data_vars\\)\\)\")",
+      "Bash(\"C:\\\\Users\\\\colin\\\\anaconda3\\\\python.exe\" -c \"import netCDF4; ds=netCDF4.Dataset\\(''c:/Users/colin/Documents/These/Cours/2026-Sciences Po/TD1/data/ds_filo_lcz_aligned.nc''\\); print\\(list\\(ds.variables.keys\\(\\)\\)\\)\")"
     ]
   }
 }
