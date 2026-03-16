@@ -205,3 +205,149 @@ def make_explorer_dualmap(left_specs, right_specs, bounds, center,
     folium.LayerControl(collapsed=False).add_to(m.m2)
 
     return m
+
+from scipy.ndimage import convolve as ndimage_convolve
+
+
+
+# ── Local Moran's I on a 2D raster (queen contiguity) ─────────────────────────
+def local_morans_i(arr, weight_matrix, n_perms=999, alpha=0.05, seed=42):
+    """
+    Compute Local Moran's I for each cell of a 2D raster.
+
+    Parameters
+    ----------
+    arr      : 2D float array (NaN = missing)
+    weight_matrix : 3x3 array of spatial weights
+    n_perms  : number of permutations for the pseudo p-value
+    alpha    : significance level
+
+    Returns
+    -------
+    li       : Local Moran's I values (same shape as arr)
+    cluster  : integer map   1=HH  2=LL  3=HL  4=LH  0=ns  NaN=missing
+    p_val    : pseudo p-values
+    """
+    valid = np.isfinite(arr)
+    flat  = arr[valid]
+    mu, sigma = flat.mean(), flat.std()
+    z     = np.where(valid, (arr - mu) / sigma, np.nan)
+    z0    = np.where(valid, z, 0.0)          # NaN → 0 for convolution
+
+    #then normalize the weights so that they sum to 1 (row-standardization)
+    W = weight_matrix / weight_matrix.sum()
+
+    # you can try to change this to see if that changes the results
+    n_neigh   = ndimage_convolve(valid.astype(float), W, mode="constant", cval=0)
+    lag_sum   = ndimage_convolve(z0, W, mode="constant", cval=0)
+    spatial_lag = np.where(n_neigh > 0, lag_sum / n_neigh, np.nan)
+    li = np.where(valid, z * spatial_lag, np.nan)
+
+    # ── Conditional permutation test ─────────────────────────────────────────
+    # For each permutation, shuffle z values globally and recompute spatial lag.
+    # p-value = fraction of |Li_perm| >= |Li|  (two-sided)
+    rng     = np.random.default_rng(seed)
+    flat_z  = z[valid]
+    p_count = np.zeros(arr.shape, dtype=float)
+
+    for _ in range(n_perms):
+        z_perm       = np.full(arr.shape, np.nan)
+        z_perm[valid] = rng.permutation(flat_z)
+        z0_perm       = np.where(valid, z_perm, 0.0)
+        lag_perm      = np.where(
+            n_neigh > 0,
+            ndimage_convolve(z0_perm, W, mode="constant", cval=0) / n_neigh,
+            np.nan,
+        )
+        li_perm = np.where(valid, z * lag_perm, np.nan)
+        # accumulate where |li_perm| >= |li|
+        with np.errstate(invalid="ignore"):
+            p_count += np.where(
+                valid & np.isfinite(li_perm),
+                (np.abs(li_perm) >= np.abs(li)).astype(float),
+                0.0,
+            )
+
+    p_val = np.where(valid, p_count / n_perms, np.nan)
+
+    # ── Classify ─────────────────────────────────────────────────────────────
+    cluster = np.full(arr.shape, np.nan)
+    sig = valid & (p_val <= alpha)
+
+    cluster[sig & (z > 0) & (spatial_lag > 0)] = 1   # HH – hotspot
+    cluster[sig & (z < 0) & (spatial_lag < 0)] = 2   # LL – coldspot
+    cluster[sig & (z > 0) & (spatial_lag < 0)] = 3   # HL – outlier (high, low nbrs)
+    cluster[sig & (z < 0) & (spatial_lag > 0)] = 4   # LH – outlier (low, high nbrs)
+    cluster[valid & ~sig]                        = 0  # not significant
+
+    return li, cluster, p_val
+
+
+def local_lee_l(arr_x, arr_y, weight_matrix, n_perms=999, alpha=0.05, seed=42):
+    """
+    Local Lee's L bivariate spatial autocorrelation (Lee 2001).
+
+    L_i = 0.5 * (z_x,i * lag(z_y)_i  +  z_y,i * lag(z_x)_i)
+
+    Quadrant classification (significant cells only):
+        1 = HH  z_x > 0, lag(z_y) > 0  → both co-cluster high
+        2 = LL  z_x < 0, lag(z_y) < 0  → both co-cluster low  (vulnerability hotspot)
+        3 = HL  z_x > 0, lag(z_y) < 0  → spatial mismatch
+        4 = LH  z_x < 0, lag(z_y) > 0  → spatial mismatch
+        0 = not significant
+    """
+    valid = np.isfinite(arr_x) & np.isfinite(arr_y)
+
+    def _standardise(arr):
+        flat = arr[valid]
+        return np.where(valid, (arr - flat.mean()) / flat.std(), np.nan)
+
+    zx = _standardise(arr_x)
+    zy = _standardise(arr_y)
+
+    W = weight_matrix / weight_matrix.sum()
+    valid_f = valid.astype(float)
+    n_neigh = ndimage_convolve(valid_f, W, mode="constant", cval=0)
+
+    def _lag(z):
+        z0 = np.where(valid, z, 0.0)
+        lag_sum = ndimage_convolve(z0, W, mode="constant", cval=0)
+        return np.where(n_neigh > 0, lag_sum / n_neigh, np.nan)
+
+    lag_zx = _lag(zx)
+    lag_zy = _lag(zy)
+
+    L = np.where(valid, 0.5 * (zx * lag_zy + zy * lag_zx), np.nan)
+
+    # ── Permutation test: fix z_x, shuffle z_y ───────────────────────────────
+    rng    = np.random.default_rng(seed)
+    flat_zy = zy[valid]
+    p_count = np.zeros(arr_x.shape, dtype=float)
+
+    for _ in range(n_perms):
+        zy_perm        = np.full(arr_x.shape, np.nan)
+        zy_perm[valid] = rng.permutation(flat_zy)
+        lag_zy_perm    = _lag(zy_perm)
+        zy_perm0       = np.where(valid, zy_perm, 0.0)
+        L_perm = np.where(valid,
+                          0.5 * (zx * lag_zy_perm + zy_perm * lag_zx), np.nan)
+        with np.errstate(invalid="ignore"):
+            p_count += np.where(
+                valid & np.isfinite(L_perm),
+                (np.abs(L_perm) >= np.abs(L)).astype(float),
+                0.0,
+            )
+
+    p_val = np.where(valid, p_count / n_perms, np.nan)
+
+    # ── Classify by sign of z_x and lag(z_y) ─────────────────────────────────
+    cluster = np.full(arr_x.shape, np.nan)
+    sig = valid & (p_val <= alpha)
+
+    cluster[sig & (zx > 0) & (lag_zy > 0)] = 1   # HH
+    cluster[sig & (zx < 0) & (lag_zy < 0)] = 2   # LL  ← double burden
+    cluster[sig & (zx > 0) & (lag_zy < 0)] = 3   # HL
+    cluster[sig & (zx < 0) & (lag_zy > 0)] = 4   # LH
+    cluster[valid & ~sig]                   = 0   # not significant
+
+    return L, cluster, p_val, lag_zy
